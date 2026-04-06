@@ -1,0 +1,6 @@
+{"timestamp": "2024-04-06T12:00:00Z", "level": "INFO", "message": "Application started"}
+{"timestamp": "2024-04-06T12:01:00Z", "level": "WARN", "message": "Low disk space"}
+{"timestamp": "2024-04-06T12:02:00Z", "level": "ERROR", "message": "Database connection failed"}
+{"timestamp": "2024-04-06T12:03:00Z", "level": "INFO", "message": "User logged in"}
+invalid json line
+{"timestamp": "2024-04-06T12:04:00Z", "level": "ERROR", "message": "Fatal error"}
