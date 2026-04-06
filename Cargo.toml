@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/01-log-analyzer",
+    "crates/02-mini-http",
+    "crates/03-async-scraper",
+    "crates/04-kv-store",
+    "crates/05-task-queue",
+    "crates/06-query-engine",
+    "shared",
+]
+resolver = "2"
