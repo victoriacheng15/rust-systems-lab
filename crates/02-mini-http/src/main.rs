@@ -1,7 +1,7 @@
 use std::fs;
-use std::io::{prelude::*, BufReader};
+use std::io::{BufReader, prelude::*};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -52,14 +52,16 @@ fn handle_connection(mut stream: TcpStream, request_count: Arc<Mutex<u32>>) {
         Ok(c) => c,
         Err(_) => format!(
             "<html><body><h1>{}</h1><p>Served by Phase 2 Mini HTTP</p></body></html>",
-            if status_line.contains("200") { "Hello!" } else { "404 Not Found" }
+            if status_line.contains("200") {
+                "Hello!"
+            } else {
+                "404 Not Found"
+            }
         ),
     };
 
     let length = contents.len();
-    let response = format!(
-        "{status_line}\r\nContent-Length: {length}\r\n\r\n{contents}"
-    );
+    let response = format!("{status_line}\r\nContent-Length: {length}\r\n\r\n{contents}");
 
     stream.write_all(response.as_bytes()).unwrap();
 }
@@ -128,17 +130,19 @@ struct Worker {
 
 impl Worker {
     fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
-        let thread = thread::spawn(move || loop {
-            let message = receiver.lock().unwrap().recv();
+        let thread = thread::spawn(move || {
+            loop {
+                let message = receiver.lock().unwrap().recv();
 
-            match message {
-                Ok(job) => {
-                    println!("Worker {id} got a job; executing.");
-                    job();
-                }
-                Err(_) => {
-                    println!("Worker {id} disconnected; shutting down.");
-                    break;
+                match message {
+                    Ok(job) => {
+                        println!("Worker {id} got a job; executing.");
+                        job();
+                    }
+                    Err(_) => {
+                        println!("Worker {id} disconnected; shutting down.");
+                        break;
+                    }
                 }
             }
         });
