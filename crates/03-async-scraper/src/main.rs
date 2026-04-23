@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::{sleep, Duration};
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::{Duration, sleep};
 use tracing::{info, instrument, warn};
 
 #[derive(Debug, Clone, Copy)]
@@ -59,7 +59,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         for (url, kind) in targets {
             info!("Producer queuing {} [{:?}]", url, kind);
-            if let Err(_) = request_tx.send(ScrapeRequest { url: url.to_string(), kind }).await {
+            if let Err(_) = request_tx
+                .send(ScrapeRequest {
+                    url: url.to_string(),
+                    kind,
+                })
+                .await
+            {
                 break;
             }
         }
@@ -67,13 +73,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Result consumer
     let consumer_handle = tokio::spawn(async move {
-        println!("{:<10} | {:<50} | {:<25} | {}", "KIND", "TITLE", "DATE", "LINK");
+        println!(
+            "{:<10} | {:<50} | {:<25} | {}",
+            "KIND", "TITLE", "DATE", "LINK"
+        );
         println!("{:-<120}", "");
         while let Some(result) = result_rx.recv().await {
             println!(
                 "{:<10} | {:<50} | {:<25} | {}",
                 format!("{:?}", result.kind),
-                if result.title.len() > 47 { format!("{}...", &result.title[..47]) } else { result.title },
+                if result.title.len() > 47 {
+                    format!("{}...", &result.title[..47])
+                } else {
+                    result.title
+                },
                 result.publish_date,
                 result.link
             );
@@ -111,7 +124,13 @@ async fn worker(
                 Ok(response) => {
                     let status = response.status();
                     let bytes = response.bytes().await.unwrap_or_default();
-                    info!("Worker {} fetched {} (Status: {}, Bytes: {})", id, req.url, status, bytes.len());
+                    info!(
+                        "Worker {} fetched {} (Status: {}, Bytes: {})",
+                        id,
+                        req.url,
+                        status,
+                        bytes.len()
+                    );
 
                     match req.kind {
                         ScrapeType::Html => {
@@ -145,21 +164,24 @@ async fn worker(
 fn parse_fcc_news_page(bytes: &[u8]) -> Vec<ScrapeResult> {
     let html = String::from_utf8_lossy(bytes);
     let document = scraper::Html::parse_document(&html);
-    
+
     let article_selector = scraper::Selector::parse("article").unwrap();
     let title_selector = scraper::Selector::parse("h2").unwrap();
     let link_selector = scraper::Selector::parse("a").unwrap();
     let time_selector = scraper::Selector::parse("time").unwrap();
 
-    document.select(&article_selector)
+    document
+        .select(&article_selector)
         .take(5)
         .map(|article| {
-            let title = article.select(&title_selector)
+            let title = article
+                .select(&title_selector)
                 .next()
                 .map(|el| el.text().collect::<String>())
                 .unwrap_or_else(|| "No Title".to_string());
 
-            let link = article.select(&link_selector)
+            let link = article
+                .select(&link_selector)
                 .next()
                 .and_then(|el| el.value().attr("href"))
                 .map(|href| {
@@ -171,7 +193,8 @@ fn parse_fcc_news_page(bytes: &[u8]) -> Vec<ScrapeResult> {
                 })
                 .unwrap_or_default();
 
-            let publish_date = article.select(&time_selector)
+            let publish_date = article
+                .select(&time_selector)
                 .next()
                 .and_then(|el| el.value().attr("datetime"))
                 .unwrap_or("Unknown Date")
@@ -189,26 +212,30 @@ fn parse_fcc_news_page(bytes: &[u8]) -> Vec<ScrapeResult> {
 
 fn parse_rss(bytes: &[u8]) -> Vec<ScrapeResult> {
     match feed_rs::parser::parse(bytes) {
-        Ok(feed) => {
-            feed.entries
-                .into_iter()
-                .take(5)
-                .map(|entry| {
-                    let link = entry.links.first().map(|l| l.href.clone()).unwrap_or_default();
-                    let title = entry.title.map(|t| t.content).unwrap_or_default();
-                    let publish_date = entry.published
-                        .map(|d| d.to_rfc3339())
-                        .unwrap_or_else(|| "Unknown Date".to_string());
-                    
-                    ScrapeResult {
-                        link,
-                        title,
-                        publish_date,
-                        kind: ScrapeType::Rss,
-                    }
-                })
-                .collect()
-        }
+        Ok(feed) => feed
+            .entries
+            .into_iter()
+            .take(5)
+            .map(|entry| {
+                let link = entry
+                    .links
+                    .first()
+                    .map(|l| l.href.clone())
+                    .unwrap_or_default();
+                let title = entry.title.map(|t| t.content).unwrap_or_default();
+                let publish_date = entry
+                    .published
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_else(|| "Unknown Date".to_string());
+
+                ScrapeResult {
+                    link,
+                    title,
+                    publish_date,
+                    kind: ScrapeType::Rss,
+                }
+            })
+            .collect(),
         Err(_) => vec![],
     }
 }

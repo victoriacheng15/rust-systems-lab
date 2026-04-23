@@ -1,33 +1,27 @@
-# 🦀 Rust Systems Lab
+# Rust Systems Lab
 
-A sequenced progression through Rust systems engineering, structured as a Cargo workspace to compound mastery in ownership, concurrency, and distributed architecture.
+Rust Systems Lab is a Cargo workspace for learning Rust through small systems projects. Each crate focuses on one practical backend or infrastructure concept, starting with command-line parsing and moving through networking, async work, storage, durable queues, and query execution.
 
-## 🏗️ Workspace Structure
+The goal is not to build production services. The goal is to understand how real systems are shaped at a smaller scale: how data moves through a program, how state is represented, how processes communicate, how durability works, and how Rust's ownership model affects those designs.
 
-All projects are located in the `crates/` directory, following a strict "Foundations to Distributed" order.
+## Repository Structure
 
-- **`01-log-analyzer`**: CLI, pattern matching, and zero-copy parsing.
-- **`02-mini-http`**: `std::net`, TCP, and thread pool implementation.
-- **`03-async-scraper`**: `tokio`, async I/O, and backpressure management.
-- **`04-kv-store`**: State management, binary serialization, and WAL recovery.
-- **`05-task-queue`**: gRPC, idempotency, and distributed reliability.
-- **`06-query-engine`**: B+ Trees, query parsing, and memory arena allocation.
+All projects are located in the `crates/` directory, following a strict "Foundations to Distributed" order. Each crate has its own README with manual usage commands.
 
----
+- **[`01-log-analyzer`](crates/01-log-analyzer/README.md)**: CLI, pattern matching, and zero-copy parsing.
+- **[`02-mini-http`](crates/02-mini-http/README.md)**: `std::net`, TCP, and thread pool implementation.
+- **[`03-async-scraper`](crates/03-async-scraper/README.md)**: `tokio`, async I/O, and backpressure management.
+- **[`04-kv-store`](crates/04-kv-store/README.md)**: State management, binary serialization, and WAL recovery.
+- **[`05-task-queue`](crates/05-task-queue/README.md)**: Durable queue semantics, idempotency, leasing, and WAL replay.
+- **[`06-query-engine`](crates/06-query-engine/README.md)**: B+ tree-style indexing, query parsing, and memory arena allocation.
 
-## 🚀 The Roadmap
+## How To Use This Repo
 
-- 🟢 **Phase 1: 01-CLI Log Analyzer** - Ownership, `Result`/`Option`, `clap`, `serde`.
-- 🟢 **Phase 2: 02-Minimal HTTP Server** - TCP streams, thread pools, `Arc` + `Mutex`.
-- 🟡 **Phase 3: 03-Async Web Scraper** - `tokio`, `reqwest`, `mpsc` channels, `tracing`.
-- 🟡 **Phase 4: 04-In-Memory KV Store** - `RwLock`, binary serialization, WAL, snapshotting.
-- 🔴 **Phase 5: 05-Distributed Task Queue** - gRPC, leader election, exactly-once semantics.
-- 🔴 **Phase 6: 06-Embedded Query Engine** - B+ tree indexing, `nom`, memory arena.
+Start with the crate README for the project you want to inspect. Each one explains what the crate demonstrates and includes manual commands that can be run from the repository root.
 
----
+The workspace can also be checked as a whole:
 
-## 🛠️ Standards
-
-- **Validation:** `cargo check` and `cargo test` for all crates.
-- **Observability:** `tracing` integration for all 🟡 and 🔴 phases.
-- **Safety:** Zero `unsafe` code unless strictly required for Phase 6 performance.
+```bash
+cargo check --workspace
+cargo test --workspace
+```
