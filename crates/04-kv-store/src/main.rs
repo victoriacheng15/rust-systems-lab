@@ -59,7 +59,8 @@ impl KvStore {
                 if cursor + 8 > buffer.len() {
                     break;
                 }
-                let len = u64::from_le_bytes(buffer[cursor..cursor + 8].try_into().unwrap()) as usize;
+                let len =
+                    u64::from_le_bytes(buffer[cursor..cursor + 8].try_into().unwrap()) as usize;
                 cursor += 8;
 
                 if cursor + len > buffer.len() {
