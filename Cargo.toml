@@ -6,6 +6,7 @@ members = [
     "crates/04-kv-store",
     "crates/05-task-queue",
     "crates/06-query-engine",
+    "crates/07-bittorrent-client",
     "shared",
 ]
 resolver = "2"

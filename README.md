@@ -14,6 +14,7 @@ All projects are located in the `crates/` directory, following a strict "Foundat
 - **[`04-kv-store`](crates/04-kv-store/README.md)**: State management, binary serialization, and WAL recovery.
 - **[`05-task-queue`](crates/05-task-queue/README.md)**: Durable queue semantics, idempotency, leasing, and WAL replay.
 - **[`06-query-engine`](crates/06-query-engine/README.md)**: B+ tree-style indexing, query parsing, and memory arena allocation.
+- **[`07-bittorrent-client`](crates/07-bittorrent-client/README.md)**: Bencode parsing, torrent metadata inspection, and correct `info_hash` extraction.
 
 ## How To Use This Repo
 
