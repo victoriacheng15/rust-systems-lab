@@ -3,6 +3,13 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Parser)]
 #[command(author, version, about = "Minimal BitTorrent client foundations")]
@@ -21,6 +28,19 @@ enum Commands {
         /// TCP port this client would listen on for peers
         #[arg(long, default_value_t = 6881)]
         port: u16,
+    },
+    /// Discover peers and complete one BitTorrent TCP handshake
+    Handshake {
+        path: PathBuf,
+        /// TCP port this client would listen on for peers
+        #[arg(long, default_value_t = 6881)]
+        port: u16,
+        /// Number of tracker peers to try before giving up
+        #[arg(long, default_value_t = 20)]
+        max_peers: usize,
+        /// Per-peer TCP and handshake timeout in milliseconds
+        #[arg(long, default_value_t = 5_000)]
+        timeout_ms: u64,
     },
 }
 
@@ -59,6 +79,13 @@ struct TorrentMeta {
 struct TrackerResponse {
     interval: Option<i64>,
     peers: Vec<SocketAddrV4>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PeerHandshake {
+    reserved: [u8; 8],
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
 }
 
 impl<'a> BencodeParser<'a> {
@@ -459,22 +486,11 @@ fn percent_encode_bytes(bytes: &[u8]) -> String {
 async fn tracker(path: PathBuf, port: u16) -> Result<()> {
     let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let meta = TorrentMeta::from_bytes(&bytes)?;
-    let peer_id = *b"-RS0001-000000000001";
-    let url = build_tracker_url(&meta, &peer_id, port)?;
 
     println!("tracker: {}", meta.announce.as_deref().unwrap_or("(none)"));
     println!("requesting compact peer list...");
 
-    let response_bytes = reqwest::get(&url)
-        .await
-        .with_context(|| format!("requesting tracker URL for {}", meta.name))?
-        .error_for_status()
-        .context("tracker returned an HTTP error")?
-        .bytes()
-        .await
-        .context("reading tracker response body")?;
-
-    let response = TrackerResponse::from_bytes(&response_bytes)?;
+    let response = request_tracker_response(&meta, port).await?;
     if let Some(interval) = response.interval {
         println!("interval: {} seconds", interval);
     }
@@ -487,6 +503,25 @@ async fn tracker(path: PathBuf, port: u16) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn request_tracker_response(meta: &TorrentMeta, port: u16) -> Result<TrackerResponse> {
+    let peer_id = default_peer_id();
+    let url = build_tracker_url(meta, &peer_id, port)?;
+    let response_bytes = reqwest::get(&url)
+        .await
+        .with_context(|| format!("requesting tracker URL for {}", meta.name))?
+        .error_for_status()
+        .context("tracker returned an HTTP error")?
+        .bytes()
+        .await
+        .context("reading tracker response body")?;
+
+    TrackerResponse::from_bytes(&response_bytes)
+}
+
+fn default_peer_id() -> [u8; 20] {
+    *b"-RS0001-000000000001"
 }
 
 impl TrackerResponse {
@@ -528,112 +563,130 @@ fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>> {
         .collect())
 }
 
+async fn handshake(path: PathBuf, port: u16, max_peers: usize, timeout_ms: u64) -> Result<()> {
+    if max_peers == 0 {
+        bail!("max-peers must be greater than zero");
+    }
+
+    let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let meta = TorrentMeta::from_bytes(&bytes)?;
+    let peer_id = default_peer_id();
+    let timeout = Duration::from_millis(timeout_ms);
+    let tracker_response = request_tracker_response(&meta, port).await?;
+
+    println!("tracker peers: {}", tracker_response.peers.len());
+    for peer in tracker_response.peers.iter().take(max_peers) {
+        println!("trying {}", peer);
+        match connect_and_handshake(*peer, &meta.info_hash, &peer_id, timeout).await {
+            Ok(response) => {
+                println!("connected: {}", peer);
+                println!("peer id: {}", String::from_utf8_lossy(&response.peer_id));
+                println!("reserved: {}", hex_bytes(&response.reserved));
+                return Ok(());
+            }
+            Err(error) => {
+                println!("failed {}: {}", peer, error);
+            }
+        }
+    }
+
+    bail!(
+        "no peer completed a BitTorrent handshake after trying {} peers",
+        max_peers.min(tracker_response.peers.len())
+    )
+}
+
+async fn connect_and_handshake(
+    peer: SocketAddrV4,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    timeout: Duration,
+) -> Result<PeerHandshake> {
+    let mut stream = time::timeout(timeout, TcpStream::connect(peer))
+        .await
+        .with_context(|| format!("timed out connecting to {peer}"))?
+        .with_context(|| format!("connecting to {peer}"))?;
+
+    let response = time::timeout(
+        timeout,
+        perform_peer_handshake(&mut stream, info_hash, peer_id),
+    )
+    .await
+    .with_context(|| format!("timed out during handshake with {peer}"))?
+    .with_context(|| format!("handshaking with {peer}"))?;
+
+    if &response.info_hash != info_hash {
+        bail!("peer returned a different info_hash");
+    }
+
+    Ok(response)
+}
+
+async fn perform_peer_handshake<S>(
+    stream: &mut S,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+) -> Result<PeerHandshake>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = build_peer_handshake(info_hash, peer_id);
+    stream
+        .write_all(&request)
+        .await
+        .context("sending handshake")?;
+
+    let mut response = [0u8; 68];
+    stream
+        .read_exact(&mut response)
+        .await
+        .context("reading handshake")?;
+
+    parse_peer_handshake(&response)
+}
+
+fn build_peer_handshake(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> [u8; 68] {
+    let mut handshake = [0u8; 68];
+    handshake[0] = 19;
+    handshake[1..20].copy_from_slice(b"BitTorrent protocol");
+    handshake[28..48].copy_from_slice(info_hash);
+    handshake[48..68].copy_from_slice(peer_id);
+    handshake
+}
+
+fn parse_peer_handshake(bytes: &[u8]) -> Result<PeerHandshake> {
+    if bytes.len() != 68 {
+        bail!("peer handshake must be 68 bytes, found {}", bytes.len());
+    }
+    if bytes[0] != 19 || &bytes[1..20] != b"BitTorrent protocol" {
+        bail!("peer did not speak the BitTorrent protocol");
+    }
+
+    let mut reserved = [0u8; 8];
+    reserved.copy_from_slice(&bytes[20..28]);
+    let mut info_hash = [0u8; 20];
+    info_hash.copy_from_slice(&bytes[28..48]);
+    let mut peer_id = [0u8; 20];
+    peer_id.copy_from_slice(&bytes[48..68]);
+
+    Ok(PeerHandshake {
+        reserved,
+        info_hash,
+        peer_id,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Inspect { path } => inspect(path),
         Commands::Tracker { path, port } => tracker(path, port).await,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_single_file_torrent_metadata() {
-        let torrent =
-            b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name8:test.txt12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
-
-        let meta = TorrentMeta::from_bytes(torrent).expect("torrent should parse");
-
-        assert_eq!(
-            meta.announce.as_deref(),
-            Some("https://tracker.example/announce")
-        );
-        assert_eq!(meta.name, "test.txt");
-        assert_eq!(meta.piece_length, 16384);
-        assert_eq!(meta.total_length, Some(12));
-        assert_eq!(meta.file_count, None);
-        assert_eq!(meta.piece_count, 1);
-    }
-
-    #[test]
-    fn hashes_original_info_bytes() {
-        let info =
-            b"d6:lengthi12e4:name8:test.txt12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
-        let torrent =
-            b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name8:test.txt12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
-
-        let meta = TorrentMeta::from_bytes(torrent).expect("torrent should parse");
-
-        assert_eq!(meta.info_hash_hex, sha1_hex(info));
-    }
-
-    #[test]
-    fn parses_multi_file_marker() {
-        let torrent = b"d4:infod5:filesld6:lengthi5e4:pathl5:a.txteed6:lengthi7e4:pathl5:b.txteee4:name4:pack12:piece lengthi32768e6:pieces20:bbbbbbbbbbbbbbbbbbbbee";
-
-        let meta = TorrentMeta::from_bytes(torrent).expect("torrent should parse");
-
-        assert_eq!(meta.mode_label(), "multi-file");
-        assert_eq!(meta.total_length, None);
-        assert_eq!(meta.file_count, Some(2));
-    }
-
-    #[test]
-    fn sha1_matches_known_vector() {
-        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
-    }
-
-    #[test]
-    fn percent_encodes_binary_tracker_parameters() {
-        assert_eq!(percent_encode_bytes(&[0, b'A', b'-', 255]), "%00A-%FF");
-    }
-
-    #[test]
-    fn builds_tracker_url_with_required_query_fields() {
-        let torrent =
-            b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name8:test.txt12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
-        let meta = TorrentMeta::from_bytes(torrent).expect("torrent should parse");
-        let url = build_tracker_url(&meta, b"-RS0001-000000000001", 6881)
-            .expect("tracker URL should build");
-
-        assert!(url.starts_with("https://tracker.example/announce?"));
-        assert!(url.contains("info_hash="));
-        assert!(url.contains("peer_id=-RS0001-000000000001"));
-        assert!(url.contains("port=6881"));
-        assert!(url.contains("uploaded=0"));
-        assert!(url.contains("downloaded=0"));
-        assert!(url.contains("left=12"));
-        assert!(url.contains("compact=1"));
-        assert!(url.contains("event=started"));
-    }
-
-    #[test]
-    fn parses_compact_tracker_peers() {
-        let response =
-            b"d8:intervali1800e5:peers12:\x7f\x00\x00\x01\x1a\xe1\xc0\x00\x02\x05\xc8\x1ae";
-
-        let response = TrackerResponse::from_bytes(response).expect("response should parse");
-
-        assert_eq!(response.interval, Some(1800));
-        assert_eq!(
-            response.peers,
-            vec![
-                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6881),
-                SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 5), 51226),
-            ]
-        );
-    }
-
-    #[test]
-    fn reports_tracker_failure_reason() {
-        let response = b"d14:failure reason13:bad info hashe";
-
-        let error = TrackerResponse::from_bytes(response).expect_err("response should fail");
-
-        assert!(error.to_string().contains("bad info hash"));
+        Commands::Handshake {
+            path,
+            port,
+            max_peers,
+            timeout_ms,
+        } => handshake(path, port, max_peers, timeout_ms).await,
     }
 }
