@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use std::fs;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -14,6 +15,13 @@ struct Cli {
 enum Commands {
     /// Read a .torrent file and print its metadata
     Inspect { path: PathBuf },
+    /// Contact the torrent's HTTP tracker and print returned peers
+    Tracker {
+        path: PathBuf,
+        /// TCP port this client would listen on for peers
+        #[arg(long, default_value_t = 6881)]
+        port: u16,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -43,7 +51,14 @@ struct TorrentMeta {
     total_length: Option<i64>,
     file_count: Option<usize>,
     piece_count: usize,
+    info_hash: [u8; 20],
     info_hash_hex: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TrackerResponse {
+    interval: Option<i64>,
+    peers: Vec<SocketAddrV4>,
 }
 
 impl<'a> BencodeParser<'a> {
@@ -211,7 +226,8 @@ impl TorrentMeta {
         let total_length = find_integer(info_dict, b"length");
         let file_count = find_list(info_dict, b"files").map(|files| files.len());
 
-        let info_hash_hex = sha1_hex(info.raw);
+        let info_hash = sha1_digest(info.raw);
+        let info_hash_hex = hex_bytes(&info_hash);
 
         Ok(Self {
             announce,
@@ -220,6 +236,7 @@ impl TorrentMeta {
             total_length,
             file_count,
             piece_count: pieces.len() / 20,
+            info_hash,
             info_hash_hex,
         })
     }
@@ -283,10 +300,14 @@ fn bytes_to_string(bytes: &[u8]) -> Result<String> {
     String::from_utf8(bytes.to_vec()).context("field was not valid UTF-8")
 }
 
+#[cfg(test)]
 fn sha1_hex(bytes: &[u8]) -> String {
-    let digest = sha1_digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    hex_bytes(&sha1_digest(bytes))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
         out.push(nibble_to_hex(byte >> 4));
         out.push(nibble_to_hex(byte & 0x0f));
     }
@@ -398,10 +419,121 @@ fn inspect(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn build_tracker_url(meta: &TorrentMeta, peer_id: &[u8; 20], port: u16) -> Result<String> {
+    let announce = meta
+        .announce
+        .as_ref()
+        .ok_or_else(|| anyhow!("torrent has no announce URL"))?;
+    let left = meta
+        .total_length
+        .ok_or_else(|| anyhow!("tracker command currently supports single-file torrents only"))?;
+    if left < 0 {
+        bail!("torrent length cannot be negative");
+    }
+
+    let separator = if announce.contains('?') { '&' } else { '?' };
+    Ok(format!(
+        "{announce}{separator}info_hash={}&peer_id={}&port={port}&uploaded=0&downloaded=0&left={left}&compact=1&event=started",
+        percent_encode_bytes(&meta.info_hash),
+        percent_encode_bytes(peer_id),
+    ))
+}
+
+fn percent_encode_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for &byte in bytes {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(nibble_to_hex(byte >> 4).to_ascii_uppercase());
+                out.push(nibble_to_hex(byte & 0x0f).to_ascii_uppercase());
+            }
+        }
+    }
+    out
+}
+
+async fn tracker(path: PathBuf, port: u16) -> Result<()> {
+    let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let meta = TorrentMeta::from_bytes(&bytes)?;
+    let peer_id = *b"-RS0001-000000000001";
+    let url = build_tracker_url(&meta, &peer_id, port)?;
+
+    println!("tracker: {}", meta.announce.as_deref().unwrap_or("(none)"));
+    println!("requesting compact peer list...");
+
+    let response_bytes = reqwest::get(&url)
+        .await
+        .with_context(|| format!("requesting tracker URL for {}", meta.name))?
+        .error_for_status()
+        .context("tracker returned an HTTP error")?
+        .bytes()
+        .await
+        .context("reading tracker response body")?;
+
+    let response = TrackerResponse::from_bytes(&response_bytes)?;
+    if let Some(interval) = response.interval {
+        println!("interval: {} seconds", interval);
+    }
+    println!("peers: {}", response.peers.len());
+    for peer in response.peers.iter().take(20) {
+        println!("- {}", peer);
+    }
+    if response.peers.len() > 20 {
+        println!("- ... {} more", response.peers.len() - 20);
+    }
+
+    Ok(())
+}
+
+impl TrackerResponse {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let root = BencodeParser::new(bytes).parse()?;
+        let root_dict = root
+            .as_dict()
+            .ok_or_else(|| anyhow!("tracker response must be a dictionary"))?;
+
+        if let Some(reason) = find_bytes(root_dict, b"failure reason") {
+            bail!("tracker failure: {}", String::from_utf8_lossy(reason));
+        }
+
+        let interval = find_integer(root_dict, b"interval");
+        let peers = find_bytes(root_dict, b"peers")
+            .ok_or_else(|| anyhow!("tracker response missing compact 'peers' field"))?;
+        let peers = parse_compact_peers(peers)?;
+
+        Ok(Self { interval, peers })
+    }
+}
+
+fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>> {
+    if bytes.len() % 6 != 0 {
+        bail!(
+            "compact peer list must be a multiple of 6 bytes, found {}",
+            bytes.len()
+        );
+    }
+
+    Ok(bytes
+        .chunks_exact(6)
+        .map(|chunk| {
+            SocketAddrV4::new(
+                Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
+                u16::from_be_bytes([chunk[4], chunk[5]]),
+            )
+        })
+        .collect())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Inspect { path } => inspect(path),
+        Commands::Tracker { path, port } => tracker(path, port).await,
     }
 }
 
@@ -453,5 +585,55 @@ mod tests {
     #[test]
     fn sha1_matches_known_vector() {
         assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    #[test]
+    fn percent_encodes_binary_tracker_parameters() {
+        assert_eq!(percent_encode_bytes(&[0, b'A', b'-', 255]), "%00A-%FF");
+    }
+
+    #[test]
+    fn builds_tracker_url_with_required_query_fields() {
+        let torrent =
+            b"d8:announce32:https://tracker.example/announce4:infod6:lengthi12e4:name8:test.txt12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        let meta = TorrentMeta::from_bytes(torrent).expect("torrent should parse");
+        let url = build_tracker_url(&meta, b"-RS0001-000000000001", 6881)
+            .expect("tracker URL should build");
+
+        assert!(url.starts_with("https://tracker.example/announce?"));
+        assert!(url.contains("info_hash="));
+        assert!(url.contains("peer_id=-RS0001-000000000001"));
+        assert!(url.contains("port=6881"));
+        assert!(url.contains("uploaded=0"));
+        assert!(url.contains("downloaded=0"));
+        assert!(url.contains("left=12"));
+        assert!(url.contains("compact=1"));
+        assert!(url.contains("event=started"));
+    }
+
+    #[test]
+    fn parses_compact_tracker_peers() {
+        let response =
+            b"d8:intervali1800e5:peers12:\x7f\x00\x00\x01\x1a\xe1\xc0\x00\x02\x05\xc8\x1ae";
+
+        let response = TrackerResponse::from_bytes(response).expect("response should parse");
+
+        assert_eq!(response.interval, Some(1800));
+        assert_eq!(
+            response.peers,
+            vec![
+                SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 6881),
+                SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 5), 51226),
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_tracker_failure_reason() {
+        let response = b"d14:failure reason13:bad info hashe";
+
+        let error = TrackerResponse::from_bytes(response).expect_err("response should fail");
+
+        assert!(error.to_string().contains("bad info hash"));
     }
 }
