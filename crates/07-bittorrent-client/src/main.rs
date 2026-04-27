@@ -95,6 +95,7 @@ struct TorrentMeta {
     total_length: Option<i64>,
     file_count: Option<usize>,
     piece_count: usize,
+    piece_hashes: Vec<[u8; 20]>,
     info_hash: [u8; 20],
     info_hash_hex: String,
 }
@@ -328,6 +329,7 @@ impl TorrentMeta {
             );
         }
 
+        let piece_hashes = parse_piece_hashes(pieces);
         let total_length = find_integer(info_dict, b"length");
         let file_count = find_list(info_dict, b"files").map(|files| files.len());
 
@@ -340,7 +342,8 @@ impl TorrentMeta {
             piece_length,
             total_length,
             file_count,
-            piece_count: pieces.len() / 20,
+            piece_count: piece_hashes.len(),
+            piece_hashes,
             info_hash,
             info_hash_hex,
         })
@@ -375,6 +378,13 @@ impl TorrentMeta {
         let remaining = total_length.saturating_sub(start);
 
         Ok(remaining.min(piece_length))
+    }
+
+    fn piece_hash_at(&self, index: u32) -> Result<[u8; 20]> {
+        self.piece_hashes
+            .get(index as usize)
+            .copied()
+            .ok_or_else(|| anyhow!("piece index {index} is outside torrent piece count"))
     }
 }
 
@@ -426,6 +436,17 @@ fn find_list<'a>(dict: &'a [(&'a [u8], Value<'a>)], key: &[u8]) -> Option<&'a Ve
 
 fn bytes_to_string(bytes: &[u8]) -> Result<String> {
     String::from_utf8(bytes.to_vec()).context("field was not valid UTF-8")
+}
+
+fn parse_piece_hashes(pieces: &[u8]) -> Vec<[u8; 20]> {
+    pieces
+        .chunks_exact(20)
+        .map(|chunk| {
+            let mut hash = [0u8; 20];
+            hash.copy_from_slice(chunk);
+            hash
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -732,6 +753,7 @@ async fn piece(
     let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let meta = TorrentMeta::from_bytes(&bytes)?;
     let piece_length = meta.piece_length_at(index)?;
+    let expected_hash = meta.piece_hash_at(index)?;
     let peer_id = default_peer_id();
     let timeout = Duration::from_millis(timeout_ms);
     let tracker_response = request_tracker_response(&meta, port).await?;
@@ -762,8 +784,9 @@ async fn piece(
                 .await
                 {
                     Ok(Ok(piece)) => {
+                        verify_piece_hash(index, &piece, &expected_hash)?;
                         println!("downloaded piece {}: {} bytes", index, piece.len());
-                        println!("note: piece hash verification is not implemented yet");
+                        println!("piece hash verified: {}", hex_bytes(&expected_hash));
                         return Ok(());
                     }
                     Ok(Err(error)) => {
@@ -1291,6 +1314,20 @@ fn build_piece_requests(piece_index: u32, piece_length: usize) -> Result<Vec<Blo
     }
 
     Ok(requests)
+}
+
+fn verify_piece_hash(index: u32, piece: &[u8], expected_hash: &[u8; 20]) -> Result<()> {
+    let actual_hash = sha1_digest(piece);
+    if &actual_hash != expected_hash {
+        bail!(
+            "piece {} failed hash verification: expected {}, got {}",
+            index,
+            hex_bytes(expected_hash),
+            hex_bytes(&actual_hash)
+        );
+    }
+
+    Ok(())
 }
 
 fn encode_message(message_id: u8, payload: &[u8]) -> Vec<u8> {

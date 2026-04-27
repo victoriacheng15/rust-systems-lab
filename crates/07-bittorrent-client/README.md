@@ -4,9 +4,9 @@
 
 ## Overview
 
-`bittorrent-client` starts with the smallest useful BitTorrent building blocks: reading a `.torrent` file, decoding bencode, extracting metadata, computing the correct `info_hash` from the original raw `info` dictionary bytes, asking an HTTP tracker for peers, completing a peer handshake, encoding peer wire messages, tracking basic peer state, and downloading a single piece into memory.
+`bittorrent-client` starts with the smallest useful BitTorrent building blocks: reading a `.torrent` file, decoding bencode, extracting metadata, computing the correct `info_hash` from the original raw `info` dictionary bytes, asking an HTTP tracker for peers, completing a peer handshake, encoding peer wire messages, tracking basic peer state, downloading a single piece into memory, and verifying that piece against the torrent metadata.
 
-This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP connections to peers, verify the BitTorrent handshake, encode/decode the core length-prefixed peer messages, update in-memory state for choke, interest, bitfield, request, and piece messages, and request piece blocks with bounded backpressure. It does not verify hashes or write file data yet.
+This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP connections to peers, verify the BitTorrent handshake, encode/decode the core length-prefixed peer messages, update in-memory state for choke, interest, bitfield, request, and piece messages, request piece blocks with bounded backpressure, and verify downloaded piece bytes with SHA-1. It does not write file data yet.
 
 ## What It Demonstrates
 
@@ -20,6 +20,7 @@ This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP 
 - Peer wire message encoding and decoding
 - Peer state transitions for choking, interest, availability, requests, and pieces
 - Bounded in-flight block requests for downloading one piece into memory
+- SHA-1 verification of downloaded pieces before accepting them
 - Small CLI structure with focused commands
 
 ## Setup Steps
@@ -32,7 +33,8 @@ This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP 
 6. Read `PeerMessage::encode` and `PeerMessage::decode` to see how peer wire messages use a 4-byte length prefix, a 1-byte message id, and optional payload bytes.
 7. Read `PeerState::apply_inbound` and `PeerState::apply_outbound` to see how messages change choking, interest, piece availability, request, and piece-block state.
 8. Read `download_piece_from_peer` to see how a bounded pipeline keeps only a limited number of block requests in flight.
-9. Check the tests to see why hashing the raw `info` bytes matters and how compact peers, handshakes, peer messages, peer state, and bounded piece downloads are decoded.
+9. Read `verify_piece_hash` to see how downloaded piece bytes are checked against the 20-byte hash from `info.pieces`.
+10. Check the tests to see why hashing the raw `info` bytes matters and how compact peers, handshakes, peer messages, peer state, bounded piece downloads, and piece verification are decoded.
 
 ## Manual Usage
 
@@ -57,7 +59,7 @@ cargo run -p bittorrent-client -- handshake path/to/file.torrent --max-peers 10 
 cargo run -p bittorrent-client -- handshake path/to/file.torrent --read-message --max-peers 50 --timeout-ms 10000
 ```
 
-Download one piece into memory without verification or file writes:
+Download and verify one piece in memory without file writes:
 
 ```bash
 cargo run -p bittorrent-client -- piece path/to/file.torrent --index 0 --pipeline 4 --max-peers 50 --timeout-ms 10000
@@ -86,4 +88,4 @@ peers: 2
 - 192.0.2.5:51226
 ```
 
-If the torrent is multi-file, this version will still inspect it, but the tracker and piece commands currently support single-file torrents only. Piece hash verification and final file assembly are not implemented yet.
+If the torrent is multi-file, this version will still inspect it, but the tracker and piece commands currently support single-file torrents only. Final file assembly is not implemented yet.

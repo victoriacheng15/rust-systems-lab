@@ -16,6 +16,7 @@ fn parses_single_file_torrent_metadata() {
     assert_eq!(meta.total_length, Some(12));
     assert_eq!(meta.file_count, None);
     assert_eq!(meta.piece_count, 1);
+    assert_eq!(meta.piece_hash_at(0).expect("piece hash"), [b'a'; 20]);
 }
 
 #[test]
@@ -397,6 +398,35 @@ fn computes_piece_lengths_for_single_file_torrents() {
     assert_eq!(meta.piece_length_at(0).expect("piece 0"), 16_384);
     assert_eq!(meta.piece_length_at(1).expect("piece 1"), 16_384);
     assert_eq!(meta.piece_length_at(2).expect("piece 2"), 7_232);
+}
+
+#[test]
+fn extracts_each_piece_hash_from_metadata() {
+    let torrent =
+        b"d4:infod6:lengthi40000e4:name8:test.bin12:piece lengthi16384e6:pieces60:aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbccccccccccccccccccccee";
+    let meta = TorrentMeta::from_bytes(torrent).expect("torrent should parse");
+
+    assert_eq!(meta.piece_hash_at(0).expect("hash 0"), [b'a'; 20]);
+    assert_eq!(meta.piece_hash_at(1).expect("hash 1"), [b'b'; 20]);
+    assert_eq!(meta.piece_hash_at(2).expect("hash 2"), [b'c'; 20]);
+}
+
+#[test]
+fn verifies_matching_piece_hash() {
+    let piece = b"piece data";
+    let expected_hash = sha1_digest(piece);
+
+    verify_piece_hash(0, piece, &expected_hash).expect("hash should match");
+}
+
+#[test]
+fn rejects_mismatched_piece_hash() {
+    let piece = b"piece data";
+    let expected_hash = sha1_digest(b"different data");
+
+    let error = verify_piece_hash(0, piece, &expected_hash).expect_err("hash should fail");
+
+    assert!(error.to_string().contains("failed hash verification"));
 }
 
 #[test]
