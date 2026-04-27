@@ -4,9 +4,9 @@
 
 ## Overview
 
-`bittorrent-client` starts with the smallest useful BitTorrent building blocks: reading a `.torrent` file, decoding bencode, extracting metadata, computing the correct `info_hash` from the original raw `info` dictionary bytes, asking an HTTP tracker for peers, and completing a peer handshake.
+`bittorrent-client` starts with the smallest useful BitTorrent building blocks: reading a `.torrent` file, decoding bencode, extracting metadata, computing the correct `info_hash` from the original raw `info` dictionary bytes, asking an HTTP tracker for peers, completing a peer handshake, and encoding peer wire messages.
 
-This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP connections to peers, and verify the BitTorrent handshake. It does not download file data yet.
+This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP connections to peers, verify the BitTorrent handshake, and encode/decode the core length-prefixed peer messages. It does not download file data yet.
 
 ## What It Demonstrates
 
@@ -17,6 +17,7 @@ This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP 
 - Compact tracker peer response parsing
 - TCP peer connection attempts with `tokio`
 - BitTorrent handshake encoding and validation
+- Peer wire message encoding and decoding
 - Small CLI structure with focused commands
 
 ## Setup Steps
@@ -26,7 +27,8 @@ This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP 
 3. Look at `TorrentMeta::from_bytes` to understand how top-level fields are extracted.
 4. Read `build_tracker_url` to see how `info_hash`, `peer_id`, and transfer counters become tracker query parameters.
 5. Read `build_peer_handshake` and `parse_peer_handshake` to see the 68-byte peer handshake layout.
-6. Check the tests to see why hashing the raw `info` bytes matters and how compact peers and handshakes are decoded.
+6. Read `PeerMessage::encode` and `PeerMessage::decode` to see how peer wire messages use a 4-byte length prefix, a 1-byte message id, and optional payload bytes.
+7. Check the tests to see why hashing the raw `info` bytes matters and how compact peers, handshakes, and peer messages are decoded.
 
 ## Manual Usage
 
@@ -48,6 +50,7 @@ Try a TCP connection and BitTorrent handshake with one discovered peer:
 ```bash
 cargo run -p bittorrent-client -- handshake path/to/file.torrent
 cargo run -p bittorrent-client -- handshake path/to/file.torrent --max-peers 10 --timeout-ms 3000
+cargo run -p bittorrent-client -- handshake path/to/file.torrent --read-message --max-peers 50 --timeout-ms 10000
 ```
 
 Example output:
