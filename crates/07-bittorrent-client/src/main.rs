@@ -118,6 +118,33 @@ enum PeerMessage {
     Port(u16),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockRequest {
+    index: u32,
+    begin: u32,
+    length: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PieceBlock {
+    index: u32,
+    begin: u32,
+    block: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerState {
+    peer_choking: bool,
+    peer_interested: bool,
+    client_choking: bool,
+    client_interested: bool,
+    available_pieces: Vec<bool>,
+    requested_blocks: Vec<BlockRequest>,
+    peer_requested_blocks: Vec<BlockRequest>,
+    received_blocks: Vec<PieceBlock>,
+    sent_blocks: Vec<PieceBlock>,
+}
+
 impl<'a> BencodeParser<'a> {
     fn new(input: &'a [u8]) -> Self {
         Self { input, pos: 0 }
@@ -623,8 +650,11 @@ async fn handshake(
                         .await
                         .with_context(|| format!("timed out reading peer message from {peer}"))?
                         .with_context(|| format!("reading peer message from {peer}"))?;
+                    let mut state = PeerState::new(meta.piece_count);
+                    state.apply_inbound(&message)?;
                     println!("message: {}", message.summary());
                     println!("raw: {}", hex_bytes(&message.encode()));
+                    println!("state: {}", state.summary());
                 }
                 return Ok(());
             }
@@ -847,6 +877,161 @@ impl PeerMessage {
             } => format!("cancel piece {index}, begin {begin}, length {length}"),
             Self::Port(port) => format!("port {port}"),
         }
+    }
+}
+
+impl PeerState {
+    fn new(piece_count: usize) -> Self {
+        Self {
+            peer_choking: true,
+            peer_interested: false,
+            client_choking: true,
+            client_interested: false,
+            available_pieces: vec![false; piece_count],
+            requested_blocks: Vec::new(),
+            peer_requested_blocks: Vec::new(),
+            received_blocks: Vec::new(),
+            sent_blocks: Vec::new(),
+        }
+    }
+
+    fn apply_inbound(&mut self, message: &PeerMessage) -> Result<()> {
+        match message {
+            PeerMessage::KeepAlive => {}
+            PeerMessage::Choke => self.peer_choking = true,
+            PeerMessage::Unchoke => self.peer_choking = false,
+            PeerMessage::Interested => self.peer_interested = true,
+            PeerMessage::NotInterested => self.peer_interested = false,
+            PeerMessage::Have(index) => self.mark_piece_available(*index)?,
+            PeerMessage::Bitfield(bitfield) => self.apply_bitfield(bitfield)?,
+            PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } => self.peer_requested_blocks.push(BlockRequest {
+                index: *index,
+                begin: *begin,
+                length: *length,
+            }),
+            PeerMessage::Piece {
+                index,
+                begin,
+                block,
+            } => self.received_blocks.push(PieceBlock {
+                index: *index,
+                begin: *begin,
+                block: block.clone(),
+            }),
+            PeerMessage::Cancel {
+                index,
+                begin,
+                length,
+            } => self.remove_peer_request(*index, *begin, *length),
+            PeerMessage::Port(_) => {}
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn apply_outbound(&mut self, message: &PeerMessage) -> Result<()> {
+        match message {
+            PeerMessage::KeepAlive => {}
+            PeerMessage::Choke => self.client_choking = true,
+            PeerMessage::Unchoke => self.client_choking = false,
+            PeerMessage::Interested => self.client_interested = true,
+            PeerMessage::NotInterested => self.client_interested = false,
+            PeerMessage::Have(_) => {}
+            PeerMessage::Bitfield(_) => {}
+            PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } => self.requested_blocks.push(BlockRequest {
+                index: *index,
+                begin: *begin,
+                length: *length,
+            }),
+            PeerMessage::Piece {
+                index,
+                begin,
+                block,
+            } => self.sent_blocks.push(PieceBlock {
+                index: *index,
+                begin: *begin,
+                block: block.clone(),
+            }),
+            PeerMessage::Cancel {
+                index,
+                begin,
+                length,
+            } => self.remove_request(*index, *begin, *length),
+            PeerMessage::Port(_) => {}
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn has_piece(&self, index: usize) -> bool {
+        self.available_pieces.get(index).copied().unwrap_or(false)
+    }
+
+    fn available_piece_count(&self) -> usize {
+        self.available_pieces
+            .iter()
+            .filter(|&&available| available)
+            .count()
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "peer_choking={}, peer_interested={}, client_choking={}, client_interested={}, available_pieces={}/{}, requested_blocks={}, received_blocks={}",
+            self.peer_choking,
+            self.peer_interested,
+            self.client_choking,
+            self.client_interested,
+            self.available_piece_count(),
+            self.available_pieces.len(),
+            self.requested_blocks.len(),
+            self.received_blocks.len()
+        )
+    }
+
+    fn mark_piece_available(&mut self, index: u32) -> Result<()> {
+        let piece = self
+            .available_pieces
+            .get_mut(index as usize)
+            .ok_or_else(|| anyhow!("piece index {index} is outside torrent piece count"))?;
+        *piece = true;
+        Ok(())
+    }
+
+    fn apply_bitfield(&mut self, bitfield: &[u8]) -> Result<()> {
+        if bitfield.len() * 8 < self.available_pieces.len() {
+            bail!("bitfield is too short for torrent piece count");
+        }
+
+        for piece_index in 0..self.available_pieces.len() {
+            let byte = bitfield[piece_index / 8];
+            let mask = 1 << (7 - (piece_index % 8));
+            self.available_pieces[piece_index] = byte & mask != 0;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn remove_request(&mut self, index: u32, begin: u32, length: u32) {
+        self.requested_blocks.retain(|request| {
+            request.index != index || request.begin != begin || request.length != length
+        });
+    }
+
+    fn remove_peer_request(&mut self, index: u32, begin: u32, length: u32) {
+        self.peer_requested_blocks.retain(|request| {
+            request.index != index || request.begin != begin || request.length != length
+        });
     }
 }
 

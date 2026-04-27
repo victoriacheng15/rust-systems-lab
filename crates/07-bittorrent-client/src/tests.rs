@@ -251,3 +251,139 @@ fn rejects_peer_message_with_wrong_payload_size() {
 
     assert!(error.to_string().contains("have message payload"));
 }
+
+#[test]
+fn peer_state_tracks_choke_and_interest_messages() {
+    let mut state = PeerState::new(4);
+
+    state.apply_inbound(&PeerMessage::Unchoke).expect("unchoke");
+    state
+        .apply_inbound(&PeerMessage::Interested)
+        .expect("interested");
+    state
+        .apply_outbound(&PeerMessage::Interested)
+        .expect("client interested");
+
+    assert!(!state.peer_choking);
+    assert!(state.peer_interested);
+    assert!(state.client_interested);
+
+    state.apply_inbound(&PeerMessage::Choke).expect("choke");
+    state
+        .apply_outbound(&PeerMessage::NotInterested)
+        .expect("client not interested");
+
+    assert!(state.peer_choking);
+    assert!(!state.client_interested);
+}
+
+#[test]
+fn peer_state_tracks_bitfield_and_have_messages() {
+    let mut state = PeerState::new(10);
+
+    state
+        .apply_inbound(&PeerMessage::Bitfield(vec![0b1010_0000, 0b0100_0000]))
+        .expect("bitfield should apply");
+
+    assert!(state.has_piece(0));
+    assert!(!state.has_piece(1));
+    assert!(state.has_piece(2));
+    assert!(!state.has_piece(3));
+    assert!(!state.has_piece(8));
+    assert!(state.has_piece(9));
+    assert_eq!(state.available_piece_count(), 3);
+
+    state.apply_inbound(&PeerMessage::Have(1)).expect("have");
+
+    assert!(state.has_piece(1));
+    assert_eq!(state.available_piece_count(), 4);
+}
+
+#[test]
+fn peer_state_rejects_out_of_range_piece_availability() {
+    let mut state = PeerState::new(2);
+
+    let error = state
+        .apply_inbound(&PeerMessage::Have(3))
+        .expect_err("piece index should fail");
+
+    assert!(error.to_string().contains("outside torrent piece count"));
+}
+
+#[test]
+fn peer_state_tracks_outbound_requests_and_cancels() {
+    let mut state = PeerState::new(4);
+    let request = PeerMessage::Request {
+        index: 2,
+        begin: 0,
+        length: 16_384,
+    };
+
+    state.apply_outbound(&request).expect("request");
+
+    assert_eq!(
+        state.requested_blocks,
+        vec![BlockRequest {
+            index: 2,
+            begin: 0,
+            length: 16_384,
+        }]
+    );
+
+    state
+        .apply_outbound(&PeerMessage::Cancel {
+            index: 2,
+            begin: 0,
+            length: 16_384,
+        })
+        .expect("cancel");
+
+    assert!(state.requested_blocks.is_empty());
+}
+
+#[test]
+fn peer_state_tracks_inbound_piece_blocks_and_peer_requests() {
+    let mut state = PeerState::new(4);
+
+    state
+        .apply_inbound(&PeerMessage::Request {
+            index: 1,
+            begin: 32,
+            length: 16,
+        })
+        .expect("peer request");
+    state
+        .apply_inbound(&PeerMessage::Piece {
+            index: 2,
+            begin: 64,
+            block: vec![1, 2, 3],
+        })
+        .expect("piece");
+
+    assert_eq!(
+        state.peer_requested_blocks,
+        vec![BlockRequest {
+            index: 1,
+            begin: 32,
+            length: 16,
+        }]
+    );
+    assert_eq!(
+        state.received_blocks,
+        vec![PieceBlock {
+            index: 2,
+            begin: 64,
+            block: vec![1, 2, 3],
+        }]
+    );
+
+    state
+        .apply_inbound(&PeerMessage::Cancel {
+            index: 1,
+            begin: 32,
+            length: 16,
+        })
+        .expect("cancel peer request");
+
+    assert!(state.peer_requested_blocks.is_empty());
+}

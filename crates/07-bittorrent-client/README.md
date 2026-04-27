@@ -4,9 +4,9 @@
 
 ## Overview
 
-`bittorrent-client` starts with the smallest useful BitTorrent building blocks: reading a `.torrent` file, decoding bencode, extracting metadata, computing the correct `info_hash` from the original raw `info` dictionary bytes, asking an HTTP tracker for peers, completing a peer handshake, and encoding peer wire messages.
+`bittorrent-client` starts with the smallest useful BitTorrent building blocks: reading a `.torrent` file, decoding bencode, extracting metadata, computing the correct `info_hash` from the original raw `info` dictionary bytes, asking an HTTP tracker for peers, completing a peer handshake, encoding peer wire messages, and tracking basic peer state.
 
-This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP connections to peers, verify the BitTorrent handshake, and encode/decode the core length-prefixed peer messages. It does not download file data yet.
+This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP connections to peers, verify the BitTorrent handshake, encode/decode the core length-prefixed peer messages, and update in-memory state for choke, interest, bitfield, request, and piece messages. It does not download file data yet.
 
 ## What It Demonstrates
 
@@ -18,6 +18,7 @@ This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP 
 - TCP peer connection attempts with `tokio`
 - BitTorrent handshake encoding and validation
 - Peer wire message encoding and decoding
+- Peer state transitions for choking, interest, availability, requests, and pieces
 - Small CLI structure with focused commands
 
 ## Setup Steps
@@ -28,7 +29,8 @@ This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP 
 4. Read `build_tracker_url` to see how `info_hash`, `peer_id`, and transfer counters become tracker query parameters.
 5. Read `build_peer_handshake` and `parse_peer_handshake` to see the 68-byte peer handshake layout.
 6. Read `PeerMessage::encode` and `PeerMessage::decode` to see how peer wire messages use a 4-byte length prefix, a 1-byte message id, and optional payload bytes.
-7. Check the tests to see why hashing the raw `info` bytes matters and how compact peers, handshakes, and peer messages are decoded.
+7. Read `PeerState::apply_inbound` and `PeerState::apply_outbound` to see how messages change choking, interest, piece availability, request, and piece-block state.
+8. Check the tests to see why hashing the raw `info` bytes matters and how compact peers, handshakes, peer messages, and peer state are decoded.
 
 ## Manual Usage
 
