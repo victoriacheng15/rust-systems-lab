@@ -11,6 +11,8 @@ use tokio::time;
 #[cfg(test)]
 mod tests;
 
+const MAX_BLOCK_LENGTH: u32 = 16 * 1024;
+
 #[derive(Parser)]
 #[command(author, version, about = "Minimal BitTorrent client foundations")]
 struct Cli {
@@ -44,6 +46,25 @@ enum Commands {
         /// Read and print one peer wire message after a successful handshake
         #[arg(long)]
         read_message: bool,
+    },
+    /// Download one piece into memory from a peer without verifying or writing it
+    Piece {
+        path: PathBuf,
+        /// Piece index to request
+        #[arg(long, default_value_t = 0)]
+        index: u32,
+        /// TCP port this client would listen on for peers
+        #[arg(long, default_value_t = 6881)]
+        port: u16,
+        /// Number of tracker peers to try before giving up
+        #[arg(long, default_value_t = 20)]
+        max_peers: usize,
+        /// Maximum in-flight block requests to one peer
+        #[arg(long, default_value_t = 4)]
+        pipeline: usize,
+        /// Per-peer operation timeout in milliseconds
+        #[arg(long, default_value_t = 10_000)]
+        timeout_ms: u64,
     },
 }
 
@@ -331,6 +352,29 @@ impl TorrentMeta {
         } else {
             "single-file"
         }
+    }
+
+    fn piece_length_at(&self, index: u32) -> Result<usize> {
+        if index as usize >= self.piece_count {
+            bail!("piece index {index} is outside torrent piece count");
+        }
+        if self.piece_length <= 0 {
+            bail!("piece length must be positive");
+        }
+
+        let total_length = self
+            .total_length
+            .ok_or_else(|| anyhow!("piece command currently supports single-file torrents only"))?;
+        if total_length < 0 {
+            bail!("torrent length cannot be negative");
+        }
+
+        let piece_length = self.piece_length as usize;
+        let total_length = total_length as usize;
+        let start = index as usize * piece_length;
+        let remaining = total_length.saturating_sub(start);
+
+        Ok(remaining.min(piece_length))
     }
 }
 
@@ -670,6 +714,79 @@ async fn handshake(
     )
 }
 
+async fn piece(
+    path: PathBuf,
+    index: u32,
+    port: u16,
+    max_peers: usize,
+    pipeline: usize,
+    timeout_ms: u64,
+) -> Result<()> {
+    if max_peers == 0 {
+        bail!("max-peers must be greater than zero");
+    }
+    if pipeline == 0 {
+        bail!("pipeline must be greater than zero");
+    }
+
+    let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let meta = TorrentMeta::from_bytes(&bytes)?;
+    let piece_length = meta.piece_length_at(index)?;
+    let peer_id = default_peer_id();
+    let timeout = Duration::from_millis(timeout_ms);
+    let tracker_response = request_tracker_response(&meta, port).await?;
+
+    println!("tracker peers: {}", tracker_response.peers.len());
+    println!(
+        "downloading piece {} ({} bytes, pipeline {})",
+        index, piece_length, pipeline
+    );
+
+    for peer in tracker_response.peers.iter().take(max_peers) {
+        println!("trying {}", peer);
+        match connect_and_handshake(*peer, &meta.info_hash, &peer_id, timeout).await {
+            Ok((mut stream, response)) => {
+                println!("connected: {}", peer);
+                println!("peer id: {}", String::from_utf8_lossy(&response.peer_id));
+
+                match time::timeout(
+                    timeout,
+                    download_piece_from_peer(
+                        &mut stream,
+                        meta.piece_count,
+                        index,
+                        piece_length,
+                        pipeline,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(piece)) => {
+                        println!("downloaded piece {}: {} bytes", index, piece.len());
+                        println!("note: piece hash verification is not implemented yet");
+                        return Ok(());
+                    }
+                    Ok(Err(error)) => {
+                        println!("failed {}: {}", peer, error);
+                    }
+                    Err(error) => {
+                        println!("failed {}: timed out downloading piece: {}", peer, error);
+                    }
+                }
+            }
+            Err(error) => {
+                println!("failed {}: {}", peer, error);
+            }
+        }
+    }
+
+    bail!(
+        "no peer downloaded piece {} after trying {} peers",
+        index,
+        max_peers.min(tracker_response.peers.len())
+    )
+}
+
 async fn connect_and_handshake(
     peer: SocketAddrV4,
     info_hash: &[u8; 20],
@@ -933,7 +1050,6 @@ impl PeerState {
         Ok(())
     }
 
-    #[cfg(test)]
     fn apply_outbound(&mut self, message: &PeerMessage) -> Result<()> {
         match message {
             PeerMessage::KeepAlive => {}
@@ -972,7 +1088,6 @@ impl PeerState {
         Ok(())
     }
 
-    #[cfg(test)]
     fn has_piece(&self, index: usize) -> bool {
         self.available_pieces.get(index).copied().unwrap_or(false)
     }
@@ -1021,7 +1136,6 @@ impl PeerState {
         Ok(())
     }
 
-    #[cfg(test)]
     fn remove_request(&mut self, index: u32, begin: u32, length: u32) {
         self.requested_blocks.retain(|request| {
             request.index != index || request.begin != begin || request.length != length
@@ -1055,6 +1169,128 @@ where
         .context("reading peer message payload")?;
 
     PeerMessage::decode(&frame)
+}
+
+async fn write_peer_message<S>(stream: &mut S, message: &PeerMessage) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    stream
+        .write_all(&message.encode())
+        .await
+        .with_context(|| format!("sending peer message: {}", message.summary()))
+}
+
+async fn download_piece_from_peer<S>(
+    stream: &mut S,
+    piece_count: usize,
+    piece_index: u32,
+    piece_length: usize,
+    pipeline: usize,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut state = PeerState::new(piece_count);
+    let interested = PeerMessage::Interested;
+    write_peer_message(stream, &interested).await?;
+    state.apply_outbound(&interested)?;
+
+    wait_until_piece_can_be_requested(stream, &mut state, piece_index).await?;
+
+    let requests = build_piece_requests(piece_index, piece_length)?;
+    let mut piece = vec![0u8; piece_length];
+    let mut next_request = 0usize;
+    let mut completed_blocks = 0usize;
+
+    while completed_blocks < requests.len() {
+        while state.requested_blocks.len() < pipeline && next_request < requests.len() {
+            let request = requests[next_request].clone();
+            let message = PeerMessage::Request {
+                index: request.index,
+                begin: request.begin,
+                length: request.length,
+            };
+            write_peer_message(stream, &message).await?;
+            state.apply_outbound(&message)?;
+            next_request += 1;
+        }
+
+        let message = read_peer_message(stream).await?;
+        match &message {
+            PeerMessage::Piece {
+                index,
+                begin,
+                block,
+            } if *index == piece_index => {
+                let begin_offset = *begin as usize;
+                let end = begin_offset + block.len();
+                if end > piece.len() {
+                    bail!("peer sent piece block beyond requested piece length");
+                }
+
+                piece[begin_offset..end].copy_from_slice(block);
+                state.remove_request(*index, *begin, block.len() as u32);
+                completed_blocks += 1;
+                println!(
+                    "received block {}/{} (begin {}, {} bytes)",
+                    completed_blocks,
+                    requests.len(),
+                    begin_offset,
+                    block.len()
+                );
+            }
+            PeerMessage::Choke => {
+                state.apply_inbound(&message)?;
+                bail!("peer choked us while downloading");
+            }
+            _ => {
+                state.apply_inbound(&message)?;
+            }
+        }
+    }
+
+    Ok(piece)
+}
+
+async fn wait_until_piece_can_be_requested<S>(
+    stream: &mut S,
+    state: &mut PeerState,
+    piece_index: u32,
+) -> Result<()>
+where
+    S: AsyncRead + Unpin,
+{
+    loop {
+        if !state.peer_choking && state.has_piece(piece_index as usize) {
+            return Ok(());
+        }
+
+        let message = read_peer_message(stream).await?;
+        state.apply_inbound(&message)?;
+        println!("message: {}", message.summary());
+        println!("state: {}", state.summary());
+    }
+}
+
+fn build_piece_requests(piece_index: u32, piece_length: usize) -> Result<Vec<BlockRequest>> {
+    if piece_length == 0 {
+        bail!("piece length must be greater than zero");
+    }
+
+    let mut requests = Vec::new();
+    let mut offset = 0usize;
+    while offset < piece_length {
+        let length = (piece_length - offset).min(MAX_BLOCK_LENGTH as usize);
+        requests.push(BlockRequest {
+            index: piece_index,
+            begin: offset as u32,
+            length: length as u32,
+        });
+        offset += length;
+    }
+
+    Ok(requests)
 }
 
 fn encode_message(message_id: u8, payload: &[u8]) -> Vec<u8> {
@@ -1116,5 +1352,13 @@ async fn main() -> Result<()> {
             timeout_ms,
             read_message,
         } => handshake(path, port, max_peers, timeout_ms, read_message).await,
+        Commands::Piece {
+            path,
+            index,
+            port,
+            max_peers,
+            pipeline,
+            timeout_ms,
+        } => piece(path, index, port, max_peers, pipeline, timeout_ms).await,
     }
 }

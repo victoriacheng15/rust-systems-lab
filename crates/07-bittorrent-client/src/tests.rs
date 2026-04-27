@@ -387,3 +387,148 @@ fn peer_state_tracks_inbound_piece_blocks_and_peer_requests() {
 
     assert!(state.peer_requested_blocks.is_empty());
 }
+
+#[test]
+fn computes_piece_lengths_for_single_file_torrents() {
+    let torrent =
+        b"d4:infod6:lengthi40000e4:name8:test.bin12:piece lengthi16384e6:pieces60:aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbccccccccccccccccccccee";
+    let meta = TorrentMeta::from_bytes(torrent).expect("torrent should parse");
+
+    assert_eq!(meta.piece_length_at(0).expect("piece 0"), 16_384);
+    assert_eq!(meta.piece_length_at(1).expect("piece 1"), 16_384);
+    assert_eq!(meta.piece_length_at(2).expect("piece 2"), 7_232);
+}
+
+#[test]
+fn builds_piece_requests_in_standard_block_sizes() {
+    let requests = build_piece_requests(3, 40_000).expect("requests should build");
+
+    assert_eq!(
+        requests,
+        vec![
+            BlockRequest {
+                index: 3,
+                begin: 0,
+                length: 16_384,
+            },
+            BlockRequest {
+                index: 3,
+                begin: 16_384,
+                length: 16_384,
+            },
+            BlockRequest {
+                index: 3,
+                begin: 32_768,
+                length: 7_232,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn downloads_piece_blocks_with_bounded_pipeline() {
+    let (mut client, mut server) = tokio::io::duplex(128 * 1024);
+    let piece_length = 40_000usize;
+    let pipeline = 2usize;
+
+    let server_task = tokio::spawn(async move {
+        let interested = read_peer_message(&mut server)
+            .await
+            .expect("interested should read");
+        assert_eq!(interested, PeerMessage::Interested);
+
+        write_peer_message(&mut server, &PeerMessage::Bitfield(vec![0b1000_0000]))
+            .await
+            .expect("bitfield should write");
+        write_peer_message(&mut server, &PeerMessage::Unchoke)
+            .await
+            .expect("unchoke should write");
+
+        let first = read_peer_message(&mut server)
+            .await
+            .expect("first request should read");
+        let second = read_peer_message(&mut server)
+            .await
+            .expect("second request should read");
+
+        let first = match first {
+            PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } => BlockRequest {
+                index,
+                begin,
+                length,
+            },
+            other => panic!("expected request, got {other:?}"),
+        };
+        let second = match second {
+            PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } => BlockRequest {
+                index,
+                begin,
+                length,
+            },
+            other => panic!("expected request, got {other:?}"),
+        };
+
+        assert_eq!(first.begin, 0);
+        assert_eq!(second.begin, 16_384);
+
+        write_peer_message(
+            &mut server,
+            &PeerMessage::Piece {
+                index: first.index,
+                begin: first.begin,
+                block: vec![1; first.length as usize],
+            },
+        )
+        .await
+        .expect("first piece should write");
+
+        let third = read_peer_message(&mut server)
+            .await
+            .expect("third request should read after one block returns");
+        let third = match third {
+            PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } => BlockRequest {
+                index,
+                begin,
+                length,
+            },
+            other => panic!("expected request, got {other:?}"),
+        };
+
+        assert_eq!(third.begin, 32_768);
+
+        for request in [second, third] {
+            write_peer_message(
+                &mut server,
+                &PeerMessage::Piece {
+                    index: request.index,
+                    begin: request.begin,
+                    block: vec![(request.begin / 16_384 + 1) as u8; request.length as usize],
+                },
+            )
+            .await
+            .expect("piece should write");
+        }
+    });
+
+    let piece = download_piece_from_peer(&mut client, 1, 0, piece_length, pipeline)
+        .await
+        .expect("piece should download");
+
+    server_task.await.expect("server task should complete");
+    assert_eq!(piece.len(), piece_length);
+    assert_eq!(&piece[0..16_384], vec![1; 16_384].as_slice());
+    assert_eq!(&piece[16_384..32_768], vec![2; 16_384].as_slice());
+    assert_eq!(&piece[32_768..40_000], vec![3; 7_232].as_slice());
+}
