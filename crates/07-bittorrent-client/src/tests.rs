@@ -148,3 +148,106 @@ async fn performs_peer_handshake_over_stream() {
     assert_eq!(response.info_hash, info_hash);
     assert_eq!(response.peer_id, remote_peer_id);
 }
+
+#[tokio::test]
+async fn reads_peer_message_from_stream() {
+    let (mut client, mut server_stream) = tokio::io::duplex(256);
+    let frame = PeerMessage::Bitfield(vec![0b1010_0000, 0b0100_0000]).encode();
+
+    let server = tokio::spawn(async move {
+        server_stream
+            .write_all(&frame)
+            .await
+            .expect("message should write");
+    });
+
+    let message = read_peer_message(&mut client)
+        .await
+        .expect("message should read");
+
+    server.await.expect("server task should complete");
+    assert_eq!(
+        message,
+        PeerMessage::Bitfield(vec![0b1010_0000, 0b0100_0000])
+    );
+    assert_eq!(message.summary(), "bitfield (2 bytes)");
+}
+
+#[test]
+fn encodes_and_decodes_keep_alive_message() {
+    let frame = PeerMessage::KeepAlive.encode();
+
+    assert_eq!(frame, vec![0, 0, 0, 0]);
+    assert_eq!(
+        PeerMessage::decode(&frame).expect("keep-alive should decode"),
+        PeerMessage::KeepAlive
+    );
+}
+
+#[test]
+fn encodes_and_decodes_simple_peer_messages() {
+    let cases = [
+        (PeerMessage::Choke, vec![0, 0, 0, 1, 0]),
+        (PeerMessage::Unchoke, vec![0, 0, 0, 1, 1]),
+        (PeerMessage::Interested, vec![0, 0, 0, 1, 2]),
+        (PeerMessage::NotInterested, vec![0, 0, 0, 1, 3]),
+    ];
+
+    for (message, expected_frame) in cases {
+        let frame = message.encode();
+
+        assert_eq!(frame, expected_frame);
+        assert_eq!(
+            PeerMessage::decode(&frame).expect("message should decode"),
+            message
+        );
+    }
+}
+
+#[test]
+fn encodes_and_decodes_payload_peer_messages() {
+    let cases = [
+        PeerMessage::Have(7),
+        PeerMessage::Bitfield(vec![0b1010_0000, 0b0100_0000]),
+        PeerMessage::Request {
+            index: 2,
+            begin: 16_384,
+            length: 16_384,
+        },
+        PeerMessage::Piece {
+            index: 2,
+            begin: 16_384,
+            block: vec![1, 2, 3, 4],
+        },
+        PeerMessage::Cancel {
+            index: 2,
+            begin: 16_384,
+            length: 16_384,
+        },
+        PeerMessage::Port(6881),
+    ];
+
+    for message in cases {
+        let frame = message.encode();
+
+        assert_eq!(
+            PeerMessage::decode(&frame).expect("message should decode"),
+            message
+        );
+    }
+}
+
+#[test]
+fn rejects_peer_message_with_bad_length_prefix() {
+    let error = PeerMessage::decode(&[0, 0, 0, 5, 2]).expect_err("frame length should be rejected");
+
+    assert!(error.to_string().contains("length exceeds frame"));
+}
+
+#[test]
+fn rejects_peer_message_with_wrong_payload_size() {
+    let error =
+        PeerMessage::decode(&[0, 0, 0, 2, 4, 0]).expect_err("have payload should be rejected");
+
+    assert!(error.to_string().contains("have message payload"));
+}

@@ -41,6 +41,9 @@ enum Commands {
         /// Per-peer TCP and handshake timeout in milliseconds
         #[arg(long, default_value_t = 5_000)]
         timeout_ms: u64,
+        /// Read and print one peer wire message after a successful handshake
+        #[arg(long)]
+        read_message: bool,
     },
 }
 
@@ -86,6 +89,33 @@ struct PeerHandshake {
     reserved: [u8; 8],
     info_hash: [u8; 20],
     peer_id: [u8; 20],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeerMessage {
+    KeepAlive,
+    Choke,
+    Unchoke,
+    Interested,
+    NotInterested,
+    Have(u32),
+    Bitfield(Vec<u8>),
+    Request {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Piece {
+        index: u32,
+        begin: u32,
+        block: Vec<u8>,
+    },
+    Cancel {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Port(u16),
 }
 
 impl<'a> BencodeParser<'a> {
@@ -563,7 +593,13 @@ fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>> {
         .collect())
 }
 
-async fn handshake(path: PathBuf, port: u16, max_peers: usize, timeout_ms: u64) -> Result<()> {
+async fn handshake(
+    path: PathBuf,
+    port: u16,
+    max_peers: usize,
+    timeout_ms: u64,
+    read_message: bool,
+) -> Result<()> {
     if max_peers == 0 {
         bail!("max-peers must be greater than zero");
     }
@@ -578,10 +614,18 @@ async fn handshake(path: PathBuf, port: u16, max_peers: usize, timeout_ms: u64) 
     for peer in tracker_response.peers.iter().take(max_peers) {
         println!("trying {}", peer);
         match connect_and_handshake(*peer, &meta.info_hash, &peer_id, timeout).await {
-            Ok(response) => {
+            Ok((mut stream, response)) => {
                 println!("connected: {}", peer);
                 println!("peer id: {}", String::from_utf8_lossy(&response.peer_id));
                 println!("reserved: {}", hex_bytes(&response.reserved));
+                if read_message {
+                    let message = time::timeout(timeout, read_peer_message(&mut stream))
+                        .await
+                        .with_context(|| format!("timed out reading peer message from {peer}"))?
+                        .with_context(|| format!("reading peer message from {peer}"))?;
+                    println!("message: {}", message.summary());
+                    println!("raw: {}", hex_bytes(&message.encode()));
+                }
                 return Ok(());
             }
             Err(error) => {
@@ -601,7 +645,7 @@ async fn connect_and_handshake(
     info_hash: &[u8; 20],
     peer_id: &[u8; 20],
     timeout: Duration,
-) -> Result<PeerHandshake> {
+) -> Result<(TcpStream, PeerHandshake)> {
     let mut stream = time::timeout(timeout, TcpStream::connect(peer))
         .await
         .with_context(|| format!("timed out connecting to {peer}"))?
@@ -619,7 +663,7 @@ async fn connect_and_handshake(
         bail!("peer returned a different info_hash");
     }
 
-    Ok(response)
+    Ok((stream, response))
 }
 
 async fn perform_peer_handshake<S>(
@@ -676,6 +720,204 @@ fn parse_peer_handshake(bytes: &[u8]) -> Result<PeerHandshake> {
     })
 }
 
+impl PeerMessage {
+    fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::KeepAlive => 0u32.to_be_bytes().to_vec(),
+            Self::Choke => encode_message(0, &[]),
+            Self::Unchoke => encode_message(1, &[]),
+            Self::Interested => encode_message(2, &[]),
+            Self::NotInterested => encode_message(3, &[]),
+            Self::Have(index) => encode_message(4, &index.to_be_bytes()),
+            Self::Bitfield(bitfield) => encode_message(5, bitfield),
+            Self::Request {
+                index,
+                begin,
+                length,
+            } => encode_message(6, &concat_u32s(&[*index, *begin, *length])),
+            Self::Piece {
+                index,
+                begin,
+                block,
+            } => {
+                let mut payload = Vec::with_capacity(8 + block.len());
+                payload.extend_from_slice(&index.to_be_bytes());
+                payload.extend_from_slice(&begin.to_be_bytes());
+                payload.extend_from_slice(block);
+                encode_message(7, &payload)
+            }
+            Self::Cancel {
+                index,
+                begin,
+                length,
+            } => encode_message(8, &concat_u32s(&[*index, *begin, *length])),
+            Self::Port(port) => encode_message(9, &port.to_be_bytes()),
+        }
+    }
+
+    fn decode(frame: &[u8]) -> Result<Self> {
+        if frame.len() < 4 {
+            bail!("peer message frame must include a 4-byte length prefix");
+        }
+
+        let length = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        let payload = frame
+            .get(4..4 + length)
+            .ok_or_else(|| anyhow!("peer message length exceeds frame"))?;
+        if frame.len() != 4 + length {
+            bail!("peer message frame has trailing bytes");
+        }
+        if length == 0 {
+            return Ok(Self::KeepAlive);
+        }
+
+        let (&message_id, payload) = payload
+            .split_first()
+            .ok_or_else(|| anyhow!("non-empty peer message missing id"))?;
+
+        match message_id {
+            0 => expect_empty_payload(payload, "choke").map(|()| Self::Choke),
+            1 => expect_empty_payload(payload, "unchoke").map(|()| Self::Unchoke),
+            2 => expect_empty_payload(payload, "interested").map(|()| Self::Interested),
+            3 => expect_empty_payload(payload, "not interested").map(|()| Self::NotInterested),
+            4 => Ok(Self::Have(read_u32_payload(payload, "have")?)),
+            5 => Ok(Self::Bitfield(payload.to_vec())),
+            6 => {
+                let [index, begin, length] = read_three_u32_payload(payload, "request")?;
+                Ok(Self::Request {
+                    index,
+                    begin,
+                    length,
+                })
+            }
+            7 => {
+                if payload.len() < 8 {
+                    bail!("piece message payload must contain index and begin");
+                }
+                Ok(Self::Piece {
+                    index: read_u32(&payload[0..4]),
+                    begin: read_u32(&payload[4..8]),
+                    block: payload[8..].to_vec(),
+                })
+            }
+            8 => {
+                let [index, begin, length] = read_three_u32_payload(payload, "cancel")?;
+                Ok(Self::Cancel {
+                    index,
+                    begin,
+                    length,
+                })
+            }
+            9 => {
+                if payload.len() != 2 {
+                    bail!("port message payload must be 2 bytes");
+                }
+                Ok(Self::Port(u16::from_be_bytes([payload[0], payload[1]])))
+            }
+            _ => bail!("unknown peer message id {}", message_id),
+        }
+    }
+
+    fn summary(&self) -> String {
+        match self {
+            Self::KeepAlive => "keep-alive".to_string(),
+            Self::Choke => "choke".to_string(),
+            Self::Unchoke => "unchoke".to_string(),
+            Self::Interested => "interested".to_string(),
+            Self::NotInterested => "not interested".to_string(),
+            Self::Have(index) => format!("have piece {index}"),
+            Self::Bitfield(bytes) => format!("bitfield ({} bytes)", bytes.len()),
+            Self::Request {
+                index,
+                begin,
+                length,
+            } => format!("request piece {index}, begin {begin}, length {length}"),
+            Self::Piece {
+                index,
+                begin,
+                block,
+            } => format!(
+                "piece data for piece {index}, begin {begin}, block {} bytes",
+                block.len()
+            ),
+            Self::Cancel {
+                index,
+                begin,
+                length,
+            } => format!("cancel piece {index}, begin {begin}, length {length}"),
+            Self::Port(port) => format!("port {port}"),
+        }
+    }
+}
+
+async fn read_peer_message<S>(stream: &mut S) -> Result<PeerMessage>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut length_prefix = [0u8; 4];
+    stream
+        .read_exact(&mut length_prefix)
+        .await
+        .context("reading peer message length")?;
+
+    let length = u32::from_be_bytes(length_prefix) as usize;
+    let mut frame = Vec::with_capacity(4 + length);
+    frame.extend_from_slice(&length_prefix);
+    frame.resize(4 + length, 0);
+    stream
+        .read_exact(&mut frame[4..])
+        .await
+        .context("reading peer message payload")?;
+
+    PeerMessage::decode(&frame)
+}
+
+fn encode_message(message_id: u8, payload: &[u8]) -> Vec<u8> {
+    let length = 1 + payload.len();
+    let mut frame = Vec::with_capacity(4 + length);
+    frame.extend_from_slice(&(length as u32).to_be_bytes());
+    frame.push(message_id);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn concat_u32s(values: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    bytes
+}
+
+fn expect_empty_payload(payload: &[u8], name: &str) -> Result<()> {
+    if !payload.is_empty() {
+        bail!("{name} message payload must be empty");
+    }
+    Ok(())
+}
+
+fn read_u32_payload(payload: &[u8], name: &str) -> Result<u32> {
+    if payload.len() != 4 {
+        bail!("{name} message payload must be 4 bytes");
+    }
+    Ok(read_u32(payload))
+}
+
+fn read_three_u32_payload(payload: &[u8], name: &str) -> Result<[u32; 3]> {
+    if payload.len() != 12 {
+        bail!("{name} message payload must be 12 bytes");
+    }
+    Ok([
+        read_u32(&payload[0..4]),
+        read_u32(&payload[4..8]),
+        read_u32(&payload[8..12]),
+    ])
+}
+
+fn read_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -687,6 +929,7 @@ async fn main() -> Result<()> {
             port,
             max_peers,
             timeout_ms,
-        } => handshake(path, port, max_peers, timeout_ms).await,
+            read_message,
+        } => handshake(path, port, max_peers, timeout_ms, read_message).await,
     }
 }
