@@ -6,7 +6,7 @@
 
 `bittorrent-client` starts with the smallest useful BitTorrent building blocks: reading a `.torrent` file, decoding bencode, extracting metadata, computing the correct `info_hash` from the original raw `info` dictionary bytes, asking an HTTP tracker for peers, completing a peer handshake, encoding peer wire messages, tracking basic peer state, downloading a single piece into memory, verifying that piece against the torrent metadata, and optionally writing the verified piece at its final file offset.
 
-This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP connections to peers, verify the BitTorrent handshake, encode/decode the core length-prefixed peer messages, update in-memory state for choke, interest, bitfield, request, and piece messages, request piece blocks with bounded backpressure, verify downloaded piece bytes with SHA-1, and write a verified single-file torrent piece into a sparse output file. It does not perform a full torrent download yet.
+This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP connections to peers, verify the BitTorrent handshake, encode/decode the core length-prefixed peer messages, update in-memory state for choke, interest, bitfield, request, and piece messages, request piece blocks with bounded backpressure, verify downloaded piece bytes with SHA-1, and write a verified single-file torrent piece into a sparse output file. It intentionally stops at protocol learning primitives instead of implementing a full torrent downloader.
 
 ## What It Demonstrates
 
@@ -98,4 +98,4 @@ peers: 2
 - 192.0.2.5:51226
 ```
 
-If the torrent is multi-file, this version will still inspect it, but the tracker and piece commands currently support single-file torrents only. Full file download orchestration is not implemented yet.
+If the torrent is multi-file, this version will still inspect it, but the tracker and piece commands currently support single-file torrents only. Full file download orchestration is outside this crate's current learning scope.
