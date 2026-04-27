@@ -4,9 +4,9 @@
 
 ## Overview
 
-`bittorrent-client` starts with the smallest useful BitTorrent building blocks: reading a `.torrent` file, decoding bencode, extracting metadata, computing the correct `info_hash` from the original raw `info` dictionary bytes, asking an HTTP tracker for peers, completing a peer handshake, encoding peer wire messages, tracking basic peer state, downloading a single piece into memory, and verifying that piece against the torrent metadata.
+`bittorrent-client` starts with the smallest useful BitTorrent building blocks: reading a `.torrent` file, decoding bencode, extracting metadata, computing the correct `info_hash` from the original raw `info` dictionary bytes, asking an HTTP tracker for peers, completing a peer handshake, encoding peer wire messages, tracking basic peer state, downloading a single piece into memory, verifying that piece against the torrent metadata, and optionally writing the verified piece at its final file offset.
 
-This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP connections to peers, verify the BitTorrent handshake, encode/decode the core length-prefixed peer messages, update in-memory state for choke, interest, bitfield, request, and piece messages, request piece blocks with bounded backpressure, and verify downloaded piece bytes with SHA-1. It does not write file data yet.
+This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP connections to peers, verify the BitTorrent handshake, encode/decode the core length-prefixed peer messages, update in-memory state for choke, interest, bitfield, request, and piece messages, request piece blocks with bounded backpressure, verify downloaded piece bytes with SHA-1, and write a verified single-file torrent piece into a sparse output file. It does not perform a full torrent download yet.
 
 ## What It Demonstrates
 
@@ -21,6 +21,7 @@ This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP 
 - Peer state transitions for choking, interest, availability, requests, and pieces
 - Bounded in-flight block requests for downloading one piece into memory
 - SHA-1 verification of downloaded pieces before accepting them
+- Writing verified pieces into their final byte offsets in a single-file output
 - Small CLI structure with focused commands
 
 ## Setup Steps
@@ -34,7 +35,8 @@ This version can contact HTTP trackers, parse compact IPv4 peer lists, open TCP 
 7. Read `PeerState::apply_inbound` and `PeerState::apply_outbound` to see how messages change choking, interest, piece availability, request, and piece-block state.
 8. Read `download_piece_from_peer` to see how a bounded pipeline keeps only a limited number of block requests in flight.
 9. Read `verify_piece_hash` to see how downloaded piece bytes are checked against the 20-byte hash from `info.pieces`.
-10. Check the tests to see why hashing the raw `info` bytes matters and how compact peers, handshakes, peer messages, peer state, bounded piece downloads, and piece verification are decoded.
+10. Read `write_piece_to_file` to see how a verified piece is placed at `piece_index * piece_length` in the final output file.
+11. Check the tests to see why hashing the raw `info` bytes matters and how compact peers, handshakes, peer messages, peer state, bounded piece downloads, piece verification, and piece file writes are decoded.
 
 ## Manual Usage
 
@@ -65,6 +67,14 @@ Download and verify one piece in memory without file writes:
 cargo run -p bittorrent-client -- piece path/to/file.torrent --index 0 --pipeline 4 --max-peers 50 --timeout-ms 10000
 ```
 
+Download, verify, and write one piece into its final offset in a local output file:
+
+```bash
+cargo run -p bittorrent-client -- piece path/to/file.torrent --index 0 --output /tmp/output.bin --pipeline 4 --max-peers 50 --timeout-ms 10000
+```
+
+The output file is sized to the torrent's total length, but only the verified piece is written. Missing pieces remain sparse/zero-filled until later pieces are downloaded and written.
+
 Example output:
 
 ```text
@@ -88,4 +98,4 @@ peers: 2
 - 192.0.2.5:51226
 ```
 
-If the torrent is multi-file, this version will still inspect it, but the tracker and piece commands currently support single-file torrents only. Final file assembly is not implemented yet.
+If the torrent is multi-file, this version will still inspect it, but the tracker and piece commands currently support single-file torrents only. Full file download orchestration is not implemented yet.

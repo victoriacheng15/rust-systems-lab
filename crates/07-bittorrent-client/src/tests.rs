@@ -430,6 +430,37 @@ fn rejects_mismatched_piece_hash() {
 }
 
 #[test]
+fn writes_verified_pieces_at_their_final_file_offsets() {
+    let torrent =
+        b"d4:infod6:lengthi40000e4:name8:test.bin12:piece lengthi16384e6:pieces60:aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbccccccccccccccccccccee";
+    let meta = TorrentMeta::from_bytes(torrent).expect("torrent should parse");
+    let path = unique_output_path("piece-offsets.bin");
+
+    write_piece_to_file(&path, &meta, 0, &vec![1; 16_384]).expect("first piece should write");
+    write_piece_to_file(&path, &meta, 2, &vec![3; 7_232]).expect("last piece should write");
+
+    let bytes = std::fs::read(&path).expect("output should read");
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(bytes.len(), 40_000);
+    assert_eq!(&bytes[0..16_384], vec![1; 16_384].as_slice());
+    assert_eq!(&bytes[16_384..32_768], vec![0; 16_384].as_slice());
+    assert_eq!(&bytes[32_768..40_000], vec![3; 7_232].as_slice());
+}
+
+#[test]
+fn rejects_piece_writes_with_wrong_length() {
+    let torrent =
+        b"d4:infod6:lengthi40000e4:name8:test.bin12:piece lengthi16384e6:pieces60:aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbccccccccccccccccccccee";
+    let meta = TorrentMeta::from_bytes(torrent).expect("torrent should parse");
+    let path = unique_output_path("wrong-length.bin");
+
+    let error = write_piece_to_file(&path, &meta, 2, &[0; 16_384]).expect_err("length should fail");
+
+    assert!(error.to_string().contains("expected 7232 bytes"));
+}
+
+#[test]
 fn builds_piece_requests_in_standard_block_sizes() {
     let requests = build_piece_requests(3, 40_000).expect("requests should build");
 
@@ -561,4 +592,17 @@ async fn downloads_piece_blocks_with_bounded_pipeline() {
     assert_eq!(&piece[0..16_384], vec![1; 16_384].as_slice());
     assert_eq!(&piece[16_384..32_768], vec![2; 16_384].as_slice());
     assert_eq!(&piece[32_768..40_000], vec![3; 7_232].as_slice());
+}
+
+fn unique_output_path(name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos();
+
+    std::env::temp_dir().join(format!(
+        "bittorrent-client-{}-{}-{name}",
+        std::process::id(),
+        nanos
+    ))
 }

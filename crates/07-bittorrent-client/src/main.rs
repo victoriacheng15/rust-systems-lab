@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -47,12 +48,15 @@ enum Commands {
         #[arg(long)]
         read_message: bool,
     },
-    /// Download one piece into memory from a peer without verifying or writing it
+    /// Download and verify one piece, optionally writing it into an output file
     Piece {
         path: PathBuf,
         /// Piece index to request
         #[arg(long, default_value_t = 0)]
         index: u32,
+        /// Optional destination file; writes only the verified piece at its final offset
+        #[arg(long)]
+        output: Option<PathBuf>,
         /// TCP port this client would listen on for peers
         #[arg(long, default_value_t = 6881)]
         port: u16,
@@ -738,6 +742,7 @@ async fn handshake(
 async fn piece(
     path: PathBuf,
     index: u32,
+    output: Option<PathBuf>,
     port: u16,
     max_peers: usize,
     pipeline: usize,
@@ -787,6 +792,10 @@ async fn piece(
                         verify_piece_hash(index, &piece, &expected_hash)?;
                         println!("downloaded piece {}: {} bytes", index, piece.len());
                         println!("piece hash verified: {}", hex_bytes(&expected_hash));
+                        if let Some(output) = output.as_deref() {
+                            write_piece_to_file(output, &meta, index, &piece)?;
+                            println!("wrote verified piece {} to {}", index, output.display());
+                        }
                         return Ok(());
                     }
                     Ok(Err(error)) => {
@@ -1330,6 +1339,61 @@ fn verify_piece_hash(index: u32, piece: &[u8], expected_hash: &[u8; 20]) -> Resu
     Ok(())
 }
 
+fn write_piece_to_file(output: &Path, meta: &TorrentMeta, index: u32, piece: &[u8]) -> Result<()> {
+    if meta.file_count.is_some() {
+        bail!("writing pieces currently supports single-file torrents only");
+    }
+
+    let total_length = meta
+        .total_length
+        .ok_or_else(|| anyhow!("torrent length is required to write pieces"))?;
+    if total_length < 0 {
+        bail!("torrent length cannot be negative");
+    }
+
+    let expected_length = meta.piece_length_at(index)?;
+    if piece.len() != expected_length {
+        bail!(
+            "piece {} has {} bytes, expected {} bytes",
+            index,
+            piece.len(),
+            expected_length
+        );
+    }
+
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating output directory {}", parent.display()))?;
+    }
+
+    let piece_length =
+        u64::try_from(meta.piece_length).context("piece length cannot be negative")?;
+    let offset = u64::from(index)
+        .checked_mul(piece_length)
+        .ok_or_else(|| anyhow!("piece offset overflow"))?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(output)
+        .with_context(|| format!("opening output file {}", output.display()))?;
+    file.set_len(total_length as u64)
+        .with_context(|| format!("sizing output file {}", output.display()))?;
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seeking output file {}", output.display()))?;
+    file.write_all(piece)
+        .with_context(|| format!("writing piece {} to {}", index, output.display()))?;
+    file.flush()
+        .with_context(|| format!("flushing output file {}", output.display()))?;
+
+    Ok(())
+}
+
 fn encode_message(message_id: u8, payload: &[u8]) -> Vec<u8> {
     let length = 1 + payload.len();
     let mut frame = Vec::with_capacity(4 + length);
@@ -1392,10 +1456,11 @@ async fn main() -> Result<()> {
         Commands::Piece {
             path,
             index,
+            output,
             port,
             max_peers,
             pipeline,
             timeout_ms,
-        } => piece(path, index, port, max_peers, pipeline, timeout_ms).await,
+        } => piece(path, index, output, port, max_peers, pipeline, timeout_ms).await,
     }
 }
