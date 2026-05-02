@@ -1,9 +1,5 @@
 # 04 KV Store
 
-[Back to workspace README](../../README.md)
-
-## Overview
-
 `kv-store` is a WAL-backed key-value store with `set`, `get`, and `remove` commands. Each write is appended to a log so later invocations can rebuild the in-memory state.
 
 ## What It Demonstrates
@@ -26,3 +22,5 @@ cargo run -p kv-store -- --wal crates/04-kv-store/kv-demo.wal get user:1
 ```
 
 The WAL file lets later commands replay earlier changes.
+
+[Back to main README](../../README.md)

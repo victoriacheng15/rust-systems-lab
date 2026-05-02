@@ -1,9 +1,5 @@
 # 06 Query Engine
 
-[Back to workspace README](../../README.md)
-
-## Overview
-
 `query-engine` is a small in-memory database core for learning how SQL-style systems parse commands, store rows, maintain an index, and execute primary-key lookups or range scans.
 
 ## What It Demonstrates
@@ -39,3 +35,5 @@ scan 1..10
 select 99
 quit
 ```
+
+[Back to main README](../../README.md)
