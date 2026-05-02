@@ -1,9 +1,5 @@
 # 02 Mini HTTP
 
-[Back to workspace README](../../README.md)
-
-## Overview
-
 `mini-http` is a synchronous HTTP server built with the Rust standard library. It accepts TCP connections, dispatches requests through a small thread pool, and returns simple HTTP responses.
 
 ## What It Demonstrates
@@ -30,3 +26,5 @@ curl -i http://127.0.0.1:7878/missing
 ```
 
 Stop the server with `Ctrl-C`.
+
+[Back to main README](../../README.md)

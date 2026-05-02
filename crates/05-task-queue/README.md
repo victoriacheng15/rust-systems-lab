@@ -1,9 +1,5 @@
 # 05 Task Queue
 
-[Back to workspace README](../../README.md)
-
-## Overview
-
 `task-queue` is a durable single-node queue engine. It supports idempotent enqueueing, worker leases, acknowledgement, failure, requeueing, queue stats, and WAL replay.
 
 ## What It Demonstrates
@@ -31,3 +27,5 @@ cargo run -p task-queue -- --wal crates/05-task-queue/tasks-demo.wal ack TASK_ID
 cargo run -p task-queue -- --wal crates/05-task-queue/tasks-demo.wal fail TASK_ID "temporary error" --requeue
 cargo run -p task-queue -- --wal crates/05-task-queue/tasks-demo.wal get TASK_ID
 ```
+
+[Back to main README](../../README.md)

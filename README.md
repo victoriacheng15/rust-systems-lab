@@ -2,7 +2,7 @@
 
 Rust Systems Lab is a Cargo workspace for learning Rust through small systems projects. Each crate focuses on one practical backend or infrastructure concept, starting with command-line parsing and moving through networking, async work, storage, durable queues, and query execution.
 
-The goal is not to build production services. The goal is to understand how real systems are shaped at a smaller scale: how data moves through a program, how state is represented, how processes communicate, how durability works, and how Rust's ownership model affects those designs.
+The goal is to understand how real systems are shaped at a smaller scale: how data moves through a program, how state is represented, how processes communicate, how durability works, and how Rust's ownership model affects those designs.
 
 ## Repository Structure
 
